@@ -1,0 +1,256 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  PART 1: Stage. Run days before the change window, after Part 0 is green.
+  3850 in INSTALL mode, single switch or stack.
+
+  Copies the image over SCP, checks the MD5,
+  then runs "install add" so the new packages are unpacked on every stack member
+  and sit Inactive until Part 2. None of this reloads the switch or changes what
+  it boots.
+
+  Safe to run again: a verified image is not copied twice, an added package is not
+  added twice. Do not run "install remove inactive" between this job and Part 2,
+  it would delete the packages this job added.
+-->
+<job xmlns="http://www.infosim.net/template"
+     xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+     xsi:schemaLocation="http://www.infosim.net/template http://xml.infosim.net/schema/job-template.xsd"
+     lifecycle="testing">
+
+  <name>Cisco IOS Upgrade - Part 1 - Stage</name>
+  <description>SCP transfer, MD5 check and install add. Run Part 0 first. Non-disruptive: does not reload and does not change the boot variable.</description>
+  <version>1</version>
+
+  <!-- SCP repository -->
+  <input type="normal" mandatory="true">
+    <id>SCPSERVER</id>
+    <name>SCP Server IP or Hostname</name>
+  </input>
+  <input type="number" mandatory="true">
+    <id>SCPPORT</id>
+    <name>SCP TCP Port</name>
+    <default>22</default>
+  </input>
+  <input type="normal" mandatory="true">
+    <id>SCPUSER</id>
+    <name>SCP Username</name>
+  </input>
+  <input type="passwd" mandatory="true">
+    <id>SCPPASSWORD</id>
+    <name>SCP Password</name>
+  </input>
+  <input type="normal" mandatory="true">
+    <id>IMAGEPATH</id>
+    <name>Image Repository Path</name>
+    <description>Directory only, no filename. Example: production/ios/17.12.06</description>
+  </input>
+
+  <!-- image and switch -->
+  <input type="normal" mandatory="true">
+    <id>IMAGENAME</id>
+    <name>IOS Image Filename</name>
+    <default>cat3k_caa-universal9.16.12.09.SPA.bin</default>
+  </input>
+  <input type="normal" mandatory="true">
+    <id>TARGET</id>
+    <name>Target Version</name>
+    <default>16.12.09</default>
+    <description>Exactly as "show version" will print it.</description>
+  </input>
+  <input type="normal" mandatory="true">
+    <id>MD5</id>
+    <name>Expected MD5 Checksum</name>
+    <description>From software.cisco.com, 32 characters, lowercase.</description>
+  </input>
+  <input type="normal" mandatory="true">
+    <id>STORAGE</id>
+    <name>Device Storage Prefix</name>
+    <default>flash:</default>
+  </input>
+  <input type="number" mandatory="true">
+    <id>REQUIRED_FREE_MB</id>
+    <name>Required Free Space in MB</name>
+    <default>1500</default>
+    <description>Same figure as in Part 0. 1 MB = 1,000,000 bytes.</description>
+  </input>
+
+  <validate name="Target version looks like 17.xx.xx" regex="^\d+\.\d+\.\d+\.\d[a-z|\d]?">$INPUT:TARGET$</validate>
+  <validate name="MD5 is 32 lowercase hex characters" regex="^[0-9a-f]{32}">$INPUT:MD5$</validate>
+  <validate name="Image name ends in .bin" regex=".*\.bin$$">$INPUT:IMAGENAME$</validate>
+
+  <!-- changed inside then/else, so declared global -->
+  <globalvariables>
+    <variable name="STOP"/>
+    <variable name="MD5OK"/>
+  </globalvariables>
+
+  <commandsequence>
+    <!-- STOP becomes yes at every failed check. Copy, install add and the green mark only run while it is no. -->
+    <variable name="STOP" value="no"/>
+    <variable name="MD5OK" value="no"/>
+
+    <!-- flash:cat9k_iosxe...bin, built from two capture groups so no two placeholders touch -->
+    <variable name="IMGPATH" value="$INPUT:STORAGE$ $INPUT:IMAGENAME$" match="(\S+) (\S+)"/>
+    <echo>START Part 1 on $REF:device:name$. Image path: $VAR:IMGPATH$</echo>
+
+    <command timeout="60sec">
+      <outputs>
+        <output key="VERSION" match="Cisco IOS XE Software, Version ([0-9A-Za-z.]+)" default="unknown"/>
+      </outputs>
+      <instruction>show version</instruction>
+    </command>
+    <echo>$REF:device:name$ runs $OUTPUT:VERSION$, target $INPUT:TARGET$</echo>
+
+    <condition value="$OUTPUT:VERSION$" equals="$INPUT:TARGET$">
+      <then>
+        <echo>Already on $INPUT:TARGET$. Nothing to stage.</echo>
+      </then>
+      <else>
+
+        <!-- ============ 1. IMAGE ON FLASH ============ -->
+        <condition value="$VAR:STOP$" equals="no">
+          <then>
+            <command timeout="60sec">
+              <outputs>
+                <!-- the last six digits are dropped, so the number is MB and stays small -->
+                <output key="FREE_MB" match="\((\d+)\d{6} bytes free\)" default="NOT_FOUND"/>
+                <output key="IMAGE_PRESENT" match="($INPUT:IMAGENAME$)" default="NOT_FOUND"/>
+              </outputs>
+              <instruction>dir $INPUT:STORAGE$</instruction>
+            </command>
+            <echo>Free on $INPUT:STORAGE$ $OUTPUT:FREE_MB$ MB. Image already there: $OUTPUT:IMAGE_PRESENT$</echo>
+
+            <condition value="$OUTPUT:IMAGE_PRESENT$" equals="NOT_FOUND" inverted="true">
+              <!-- already there: check it instead of copying again -->
+              <then>
+                <command timeout="30min">
+                  <outputs>
+                    <output key="EXISTING_MD5" match="= ([0-9a-fA-F]{32})" default="NOT_FOUND"/>
+                  </outputs>
+                  <instruction>verify /md5 $VAR:IMGPATH$</instruction>
+                </command>
+                <condition value="$OUTPUT:EXISTING_MD5$" equals="$INPUT:MD5$">
+                  <then>
+                    <variable name="MD5OK" value="yes"/>
+                    <echo>Image on flash matches the MD5. Transfer skipped.</echo>
+                  </then>
+                  <else>
+                    <variable name="STOP" value="yes"/>
+                    <error abort="false">$VAR:IMGPATH$ is on flash but its MD5 is $OUTPUT:EXISTING_MD5$, not $INPUT:MD5$. Probably a broken earlier copy. Delete it by hand and run Part 1 again.</error>
+                  </else>
+                </condition> 
+              </then>
+              <!-- not there: space check, copy, MD5 -->
+              <else>
+                <condition value="$OUTPUT:FREE_MB$" equals="NOT_FOUND">
+                  <then>
+                    <variable name="STOP" value="yes"/>
+                    <error abort="false">Could not read the free space on $INPUT:STORAGE$. Nothing copied.</error>
+                  </then>
+                  <else>
+                    <condition value="$OUTPUT:FREE_MB$" less="$INPUT:REQUIRED_FREE_MB$">
+                      <then>
+                        <variable name="STOP" value="yes"/>
+                        <error abort="false">Not enough space: $OUTPUT:FREE_MB$ MB free, $INPUT:REQUIRED_FREE_MB$ MB needed. Free space by hand ("install remove inactive" removes unused packages). Nothing copied.</error>
+                      </then>
+                    </condition>
+                  </else>
+                </condition>
+                 <!-- check if SCP can happen with specifically 3850 and 6807 switches-->
+                <command timeout="60">
+                    <outputs>
+                        <output key="SSH" match="SSH (Enabled)" default="No" />
+                    </outputs>
+                    <instruction>show ip ssh</instruction>
+                </command>
+                <condition value="$OUTPUT:SSH$" equals="no">
+                    <then>
+                        <policy severity="Critical">SSH not enabled, will not be able to copy file accross. run "ip scp server enable" with approval</policy>
+                        <variable name="STOP" value="yes" />
+                    </then>
+                    <else>
+                        <condition value="$VAR:STOP$" equals="no">
+                            <then>
+                                <echo>Copying $INPUT:IMAGENAME$ from $INPUT:SCPSERVER$.</echo>
+                                <command timeout="210min">
+                                <interactive>
+                                    <prompt match=".*Are you sure you want to continue connecting.*" response="yes" newline="true"/>
+                                    <prompt match=".*Password:.*" response="$INPUT:SCPPASSWORD$" password="true" newline="true"/>
+                                    <prompt match=".*Destination filename.*" response="" newline="true"/>
+                                </interactive>
+                                <instruction>copy SCP://$INPUT:SCPUSER$@$INPUT:SCPSERVER$:$INPUT:SCPPORT$/$INPUT:IMAGEPATH$/$INPUT:IMAGENAME$ $VAR:IMGPATH$</instruction>
+                                </command>
+                                <!-- a failed copy leaves no file or a short one; both fail the MD5 -->
+                                <command timeout="40min">
+                                <outputs>
+                                    <output key="DEVICE_MD5" match="= ([0-9a-fA-F]{32})" default="NOT_FOUND"/>
+                                </outputs>
+                                <instruction>verify /md5 $VAR:IMGPATH$</instruction>
+                                </command>
+                                <echo>Expected MD5 $INPUT:MD5$, switch calculated $OUTPUT:DEVICE_MD5$</echo>
+                                <condition value="$OUTPUT:DEVICE_MD5$" equals="$INPUT:MD5$">
+                                <then><variable name="MD5OK" value="yes"/></then>
+                                <else>
+                                    <variable name="STOP" value="yes"/>
+                                    <error abort="false">MD5 check failed after the copy (got $OUTPUT:DEVICE_MD5$). Do not use this image. Delete it and run Part 1 again.</error>
+                                </else>
+                                </condition>
+                            </then>
+                        </condition>
+                    </else>
+                </condition>
+              </else>
+            </condition>
+          </then>
+          
+        </condition>
+
+        <!-- ============ 2. INSTALL ADD ============ -->
+        <!-- Unpacks the packages on every stack member and checks their space. Does not reload. -->
+        <condition value="$VAR:STOP$" equals="no">
+          <then>
+            <command timeout="60sec">
+              <outputs>
+                <output key="ALREADYADDED" match="IMG\s+I\s+($INPUT:TARGET$\S*)" default="no"/>
+              </outputs>
+              <instruction>show install summary</instruction>
+            </command>
+            <condition value="$OUTPUT:ALREADYADDED$" equals="no">
+              <then>
+                <echo>Running install add. This takes several minutes, longer on big stacks.</echo>
+                <command timeout="60min">
+                  <outputs>
+                    <output key="ADDRESULT" match="(SUCCESS|FAILED)" default="unknown"/>
+                  </outputs>
+                  <instruction>install add file $VAR:IMGPATH$</instruction>
+                </command>
+                <condition value="$OUTPUT:ADDRESULT$" equals="SUCCESS" inverted="true">
+                  <then>
+                    <variable name="STOP" value="yes"/>
+                    <error abort="false">install add did not report SUCCESS (got $OUTPUT:ADDRESULT$). Check "show install log". A stack member short of flash shows up here. If it says the configuration has been modified, save the config (write memory) and run Part 1 again.</error>
+                  </then>
+                </condition>
+              </then>
+              <else>
+                <echo>$OUTPUT:ALREADYADDED$ is already added (Inactive). Skipping install add.</echo>
+              </else>
+            </condition>
+            <command timeout="60sec"><instruction>show install summary</instruction></command>
+          </then>
+        </condition>
+
+        <!-- ============ 3. RESULT ============ -->
+        <condition value="$VAR:STOP$" equals="no">
+          <then>
+            <echo>=== STAGED $REF:device:name$ | $OUTPUT:VERSION$ -> $INPUT:TARGET$ | MD5 ok | packages added, Inactive ===</echo>
+            <policy severity="Compliant">STAGED for $INPUT:TARGET$</policy>
+            <echo>Change Control approval is required before Part 2.</echo>
+          </then>
+          <else>
+            <echo>=== NOT STAGED $REF:device:name$: see the error above. Nothing was reloaded. ===</echo>
+          </else>
+        </condition>
+      </else>
+    </condition>
+  </commandsequence>
+</job>

@@ -1,0 +1,389 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  PART 2: Activate. Run in the change window. DISRUPTIVE: the switch reloads.
+  Catalyst 9300 / 9500 in INSTALL mode. Needs Part 1 first (packages added, Inactive).
+
+  1. Guards: install mode, manual boot off, saved config not ignored at reload, stack Ready,
+     target packages added by Part 1.
+  2. Before snapshot: stack members, interfaces up, CDP neighbours.
+  3. install activate with the auto-abort timer. The switch reloads.
+  4. Post-check against the snapshot.
+  5. Clean: install commit.
+     Not clean: install abort straight away (back on the old version),
+     or, with "Roll back at once" unticked, leave the abort timer to do it.
+
+  The abort timer is the safety net: if this job dies halfway, the switch still goes
+  back to the old version on its own when the timer runs out, unless it was committed.
+-->
+<job xmlns="http://www.infosim.net/template"
+     xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+     xsi:schemaLocation="http://www.infosim.net/template http://xml.infosim.net/schema/job-template.xsd"
+     lifecycle="testing">
+
+  <name>Cisco IOS Upgrade - Part 2 - Activate</name>
+  <description>install activate with auto-abort timer, post-check, then install commit, or install abort if the post-check fails. DISRUPTIVE. Run only after change approval.</description>
+  <version>1</version>
+
+  <input type="normal" mandatory="true">
+    <id>CHANGEID</id>
+    <name>Change ID</name>
+    <default>CHG-0000</default>
+  </input>
+  <input type="normal" mandatory="true">
+    <id>TARGET</id>
+    <name>Target Version</name>
+    <default>17.12.06</default>
+    <description>Same as in Part 1.</description>
+  </input>
+  <input type="boolean">
+    <id>CHANGE_APPROVED</id>
+    <name>Change Control Approved, the switch may reload now</name>
+    <default>false</default>
+  </input>
+  <input type="number" mandatory="true" minValue="30" maxValue="180">
+    <id>ABORTTIMER</id>
+    <name>Auto-abort timer (minutes)</name>
+    <default>90</default>
+    <description>The switch rolls itself back if not committed within this time. Must cover the reload, the settle time and the post-check. The switch accepts 30 to 1200.</description>
+  </input>
+  <input type="normal" mandatory="true">
+    <id>RELOADUP</id>
+    <name>Max time for the switch to come back</name>
+    <default>45min</default>
+    <description>A number and sec or min. Measure the slowest reload in the lab.</description>
+  </input>
+  <input type="normal" mandatory="true">
+    <id>SETTLE</id>
+    <name>Settle time after reload</name>
+    <default>5min</default>
+    <description>Time for STP, CDP, PoE phones and access points to come up before the post-check.</description>
+  </input>
+  <input type="boolean">
+    <id>ROLLBACK_NOW</id>
+    <name>Roll back at once if the post-check fails</name>
+    <default>true</default>
+    <description>Ticked: install abort straight away. Unticked: stay on the new version until the abort timer runs out, so someone can look first and commit on the console if it is fine.</description>
+  </input>
+
+  <!-- stops the job on every switch before any command is sent -->
+  <validate name="Change Control approved" regex="^true$$">$INPUT:CHANGE_APPROVED$</validate>
+  <validate name="Target version looks like 17.xx.xx" regex="^\d+\.\d+\.\d+\.\d[a-z|\d]?">$INPUT:TARGET$</validate>
+  <validate name="Reload wait is a number and sec or min" regex="^[0-9]+(sec|min)$$">$INPUT:RELOADUP$</validate>
+  <validate name="Settle time is a number and sec or min" regex="^[0-9]+(sec|min)$$">$INPUT:SETTLE$</validate>
+
+  <globalvariables>
+    <variable name="STOP"/>
+    <variable name="POSTOK"/>
+    <variable name="PRE_VERSION"/>
+    <variable name="PRE_MEMBERS"/>
+    <variable name="PRE_IFUP"/>
+    <variable name="PRE_CDP"/>
+    <variable name="POST_MEMBERS_N"/>
+  </globalvariables>
+
+  <commandsequence>
+    <variable name="STOP" value="no"/>
+    <echo>START Part 2 on $REF:device:name$, change $INPUT:CHANGEID$</echo>
+
+    <command timeout="60sec">
+      <outputs>
+        <output key="VERSION" match="Cisco IOS XE Software, Version ([0-9A-Za-z.]+)" default="unknown"/>
+      </outputs>
+      <instruction>show version</instruction>
+    </command>
+
+    <condition value="$OUTPUT:VERSION$" equals="$INPUT:TARGET$">
+      <then>
+        <!-- already on target: committed, or activated earlier and still waiting for a commit.
+             IMG U = activated and uncommitted. It can exist without the abort timer (timer stopped). -->
+        <command timeout="60sec">
+          <outputs>
+            <output key="UNCOMMITTED0" match="IMG\s+U\s+(\S+)" default="none"/>
+            <output key="ABORTACTIVE0" match="(Auto abort timer: active)" default="not active"/>
+          </outputs>
+          <instruction>show install summary</instruction>
+        </command>
+        <condition value="$OUTPUT:UNCOMMITTED0$" equals="none" inverted="true">
+          <then>
+            <error abort="false">$REF:device:name$ is on $INPUT:TARGET$ but NOT committed ($OUTPUT:UNCOMMITTED0$, abort timer $OUTPUT:ABORTACTIVE0$). Check it, then "install commit" on the console, or "install abort" to go back.</error>
+          </then>
+          <else>
+            <echo>$REF:device:name$ already on $INPUT:TARGET$. Nothing to do.</echo>
+          </else>
+        </condition>
+      </then>
+      <else>
+
+        <!-- ============ 1. GUARDS ============ -->
+        <command timeout="30sec">
+          <outputs>
+            <output key="BOOTVAR" match="BOOT variable = (\S+)" default="unknown"/>
+          </outputs>
+          <instruction>show boot</instruction>
+        </command>
+        <condition value="$OUTPUT:BOOTVAR$" match=".*packages\.conf.*" inverted="true">
+          <then>
+            <variable name="STOP" value="yes"/>
+            <error abort="false">Boots $OUTPUT:BOOTVAR$: bundle mode. Not reloading.</error>
+          </then>
+        </condition>
+
+        <!-- boot settings in ROMMON: MANUAL_BOOT=yes stops the switch in ROMMON after the reload,
+             SWITCH_IGNORE_STARTUP_CFG=1 (left over from a password recovery) brings it back with an
+             empty config. Not in the output = normal. -->
+        <command timeout="30sec" ignoreerror="true">
+          <outputs>
+            <output key="MANUALBOOT" match="MANUAL_BOOT\s*=\s*(\w+)" default="no"/>
+            <output key="IGNORECFG" match="SWITCH_IGNORE_STARTUP_CFG\s*=\s*(\d)" default="1"/>
+          </outputs>
+          <instruction>show romvar</instruction>
+        </command>
+        <condition value="$OUTPUT:MANUALBOOT$" match="[Yy][Ee][Ss]">
+          <then>
+            <variable name="STOP" value="yes"/>
+            <error abort="false">MANUAL_BOOT=yes: the switch would stop in ROMMON after the reload. Not reloading. Run "no boot manual" and "write memory" first.</error>
+          </then>
+        </condition>
+        <condition value="$OUTPUT:IGNORECFG$" equals="1">
+          <then>
+            <variable name="STOP" value="yes"/>
+            <error abort="false">SWITCH_IGNORE_STARTUP_CFG=1: the switch would come back from the reload with an empty config. Not reloading. Run "no system ignore startupconfig switch all" and "write memory" first.</error>
+          </then>
+        </condition>
+
+        <command timeout="30sec" ignoreerror="true">
+          <outputs>
+            <output key="MEMBERS" match="Number of lines which match regexp = (\d+)" default="0"/>
+          </outputs>
+          <instruction>show switch | count Active|Standby|Member</instruction>
+        </command>
+        <command timeout="30sec" ignoreerror="true">
+          <outputs>
+            <output key="READY" match="Number of lines which match regexp = (\d+)" default="0"/>
+          </outputs>
+          <instruction>show switch | count Ready</instruction>
+        </command>
+        <condition value="$OUTPUT:MEMBERS" equals="0" inverted="true">
+          <then>
+            <condition value="$OUTPUT:READY$" equals="$OUTPUT:MEMBERS$" inverted="true">
+              <then>
+                <variable name="STOP" value="yes"/>
+                <error abort="false">Stack members not all Ready ($OUTPUT:READY$ of $OUTPUT:MEMBERS$). Not reloading.</error>
+              </then>
+            </condition>
+          </then>
+          <else>
+            <variable name="STOP" value="yes"/>
+            <error abort="false">no members $OUTPUT:MEMBERS$. Not reloading.</error>
+          </else>
+        </condition>
+        
+
+        <command timeout="60sec">
+          <outputs>
+            <output key="ADDED" match="IMG\s+I\s+($INPUT:TARGET$\S*)" default="no"/>
+          </outputs>
+          <instruction>show install summary</instruction>
+        </command>
+        <condition value="$OUTPUT:ADDED$" equals="no">
+          <then>
+            <variable name="STOP" value="yes"/>
+            <error abort="false">No Inactive $INPUT:TARGET$ package on $REF:device:name$. Run Part 1 first. Not reloading.</error>
+          </then>
+        </condition>
+
+        <!-- ============ 2. BEFORE SNAPSHOT AND ACTIVATE ============ -->
+        <condition value="$VAR:STOP$" equals="no">
+          <then>
+            <command timeout="60sec">
+              <outputs>
+                <output key="IFUP" match="Number of lines which match regexp = (\d+)" default="0"/>
+              </outputs>
+              <instruction>show ip interface brief | count up +up</instruction>
+            </command>
+            <command timeout="60sec" ignoreerror="true">
+              <outputs>
+                <output key="CDP" match="Number of lines which match regexp = (\d+)" default="0"/>
+              </outputs>
+              <instruction>show cdp neighbors detail | count Device ID</instruction>
+            </command>
+            <variable name="PRE_VERSION" value="$OUTPUT:VERSION$"/>
+            <variable name="PRE_MEMBERS" value="$OUTPUT:MEMBERS$"/>
+            <variable name="PRE_IFUP" value="$OUTPUT:IFUP$"/>
+            <variable name="PRE_CDP" value="$OUTPUT:CDP$"/>
+            <!-- full lists, so a person can see WHICH interface or neighbour is missing afterwards -->
+            <command timeout="60sec"><instruction>show ip interface brief | include up +up</instruction></command>
+            <command timeout="60sec" ignoreerror="true"><instruction>show cdp neighbors</instruction></command>
+            <echo>BEFORE: $REF:device:name$ on $VAR:PRE_VERSION$ | $VAR:PRE_MEMBERS$ stack member(s) | $VAR:PRE_IFUP$ interfaces up | $VAR:PRE_CDP$ CDP neighbours | change $INPUT:CHANGEID$</echo>
+
+            <!-- the config the switch comes back with is the one saved now -->
+            <command timeout="2min"><instruction>write memory</instruction></command>
+
+            <!-- restarttimeout: how long to wait to SEE the connection drop (proves the reload started).
+                 reconnecttimeout: how long to wait for the switch to come back. -->
+            <echo>Activating $INPUT:TARGET$ with a $INPUT:ABORTTIMER$ minute auto-abort timer. The switch reloads now.</echo>
+            <command timeout="30min" ignoreerror="true" restarttimeout="20min" reconnecttimeout="$INPUT:RELOADUP$">
+              <outputs>
+                <output key="ACTRESULT" match="(FAILED)" default="ok"/>
+              </outputs>
+              <instruction>install activate auto-abort-timer $INPUT:ABORTTIMER$ prompt-level none</instruction>
+            </command>
+            <condition value="$OUTPUT:ACTRESULT$" equals="FAILED">
+              <then>
+                <variable name="STOP" value="yes"/>
+                <error abort="false">install activate reported FAILED. The switch did not reload. Check "show install log".</error>
+              </then>
+            </condition>
+          </then>
+          <else><echo>Not reloading: a guard above failed. Nothing changed.</echo></else>
+        </condition>
+
+        <!-- ============ 3. POST-CHECK ============ -->
+        <condition value="$VAR:STOP$" equals="no">
+          <then>
+            <sleep time="$INPUT:SETTLE$"/>
+            <variable name="POSTOK" value="yes"/>
+
+            <command timeout="60sec">
+              <outputs>
+                <output key="POST_VERSION" match="Cisco IOS XE Software, Version ([0-9A-Za-z.]+)" default="unknown"/>
+              </outputs>
+              <instruction>show version</instruction>
+            </command>
+            <command timeout="30sec" ignoreerror="true">
+              <outputs>
+                <output key="POST_MEMBERS" match="Number of lines which match regexp = (\d+)" default="0"/>
+              </outputs>
+              <instruction>show switch | count Active|Standby|Member</instruction>
+            </command>
+            <command timeout="30sec" ignoreerror="true">
+              <outputs>
+                <output key="POST_READY" match="Number of lines which match regexp = (\d+)" default="0"/>
+              </outputs>
+              <instruction>show switch | count Ready</instruction>
+            </command>
+            <!-- member rows in show version that carry the target version -->
+            <command timeout="60sec">
+              <outputs>
+                <output key="POST_ONTARGET" match="Number of lines which match regexp = (\d+)" default="0"/>
+              </outputs>
+              <instruction>show version | count C9.* $INPUT:TARGET$</instruction>
+            </command>
+            <command timeout="60sec">
+              <outputs>
+                <output key="POST_IFUP" match="Number of lines which match regexp = (\d+)" default="0"/>
+              </outputs>
+              <instruction>show ip interface brief | count up +up</instruction>
+            </command>
+            <command timeout="60sec" ignoreerror="true">
+              <outputs>
+                <output key="POST_CDP" match="Number of lines which match regexp = (\d+)" default="0"/>
+              </outputs>
+              <instruction>show cdp neighbors detail | count Device ID</instruction>
+            </command>
+            <command timeout="60sec"><instruction>show ip interface brief | include up +up</instruction></command>
+            <command timeout="60sec" ignoreerror="true"><instruction>show cdp neighbors</instruction></command>
+            <command timeout="60sec">
+              <outputs>
+                <output key="UNCOMMITTED" match="IMG\s+U\s+(\S+)" default="none"/>
+                <output key="ABORTACTIVE" match="(Auto abort timer: active)" default="not active"/>
+              </outputs>
+              <instruction>show install summary</instruction>
+            </command>
+
+            <!-- a standalone 9500 counts 0 members but is one switch -->
+            <variable name="POST_MEMBERS_N" value="$OUTPUT:POST_MEMBERS$"/>
+            <condition value="$OUTPUT:POST_MEMBERS$" equals="0"><then><variable name="POST_MEMBERS_N" value="1"/></then></condition>
+
+            <condition value="$OUTPUT:POST_VERSION$" equals="$INPUT:TARGET$" inverted="true">
+              <then><variable name="POSTOK" value="no"/><policy severity="Critical">VERSION after reload is $OUTPUT:POST_VERSION$, expected $INPUT:TARGET$</policy></then>
+            </condition>
+            <condition value="$OUTPUT:POST_MEMBERS$" less="$VAR:PRE_MEMBERS$">
+              <then><variable name="POSTOK" value="no"/><policy severity="Critical">STACK lost members: $OUTPUT:POST_MEMBERS$ now, $VAR:PRE_MEMBERS$ before</policy></then>
+            </condition>
+            <condition value="$OUTPUT:POST_READY$" equals="$OUTPUT:POST_MEMBERS$" inverted="true">
+              <then><variable name="POSTOK" value="no"/><policy severity="Critical">STACK members not all Ready ($OUTPUT:POST_READY$ of $OUTPUT:POST_MEMBERS$)</policy></then>
+            </condition>
+            <condition value="$OUTPUT:POST_ONTARGET$" equals="$VAR:POST_MEMBERS_N$" inverted="true">
+              <then><variable name="POSTOK" value="no"/><policy severity="Critical">STACK version mismatch: $OUTPUT:POST_ONTARGET$ of $VAR:POST_MEMBERS_N$ members on $INPUT:TARGET$</policy></then>
+            </condition>
+            <condition value="$OUTPUT:POST_IFUP$" less="$VAR:PRE_IFUP$">
+              <then><variable name="POSTOK" value="no"/><policy severity="Major">INTERFACES: $OUTPUT:POST_IFUP$ up now, $VAR:PRE_IFUP$ before. Compare the two lists above.</policy></then>
+            </condition>
+            <condition value="$OUTPUT:POST_CDP$" less="$VAR:PRE_CDP$">
+              <then><variable name="POSTOK" value="no"/><policy severity="Major">NEIGHBOURS: $OUTPUT:POST_CDP$ CDP now, $VAR:PRE_CDP$ before. Compare the two lists above.</policy></then>
+            </condition>
+
+            <echo>AFTER: $REF:device:name$ on $OUTPUT:POST_VERSION$ | stack $OUTPUT:POST_READY$/$OUTPUT:POST_MEMBERS$ Ready, $OUTPUT:POST_ONTARGET$ on target | $OUTPUT:POST_IFUP$ interfaces up (was $VAR:PRE_IFUP$) | $OUTPUT:POST_CDP$ CDP (was $VAR:PRE_CDP$) | post-check ok: $VAR:POSTOK$</echo>
+
+            <!-- ============ 4. COMMIT OR ROLL BACK ============ -->
+            <condition value="$VAR:POSTOK$" equals="yes">
+              <then>
+                <!-- commit only when a package is waiting for it (IMG U) -->
+                <condition value="$OUTPUT:UNCOMMITTED$" equals="none" inverted="true">
+                  <then>
+                    <command timeout="10min">
+                      <outputs>
+                        <output key="COMMITRESULT" match="(SUCCESS|FAILED)" default="unknown"/>
+                      </outputs>
+                      <instruction>install commit</instruction>
+                    </command>
+                    <condition value="$OUTPUT:COMMITRESULT$" equals="SUCCESS">
+                      <then>
+                        <policy severity="Compliant">UPGRADED to $INPUT:TARGET$ and committed</policy>
+                      </then>
+                      <else>
+                        <error abort="false">install commit did not report SUCCESS (got $OUTPUT:COMMITRESULT$). Not committed; abort timer $OUTPUT:ABORTACTIVE$. Commit on the console now, or it rolls back when the timer runs out.</error>
+                      </else>
+                    </condition>
+                  </then>
+                  <else>
+                    <error abort="false">Post-check passed but no package is waiting for a commit (no IMG U). Check "show install summary" on the console.</error>
+                  </else>
+                </condition>
+              </then>
+              <else>
+                <condition value="$INPUT:ROLLBACK_NOW$" equals="true">
+                  <then>
+                    <echo>Post-check failed. Rolling back with install abort. The switch reloads again.</echo>
+                    <command timeout="30min" ignoreerror="true" restarttimeout="20min" reconnecttimeout="$INPUT:RELOADUP$">
+                      <interactive>
+                        <prompt match=".*[Pp]roceed.*\[y/n\].*" response="y" newline="true"/>
+                      </interactive>
+                      <outputs>
+                        <output key="ABORTRESULT" match="(FAILED)" default="ok"/>
+                      </outputs>
+                      <instruction>install abort</instruction>
+                    </command>
+                    <sleep time="$INPUT:SETTLE$"/>
+                    <command timeout="60sec">
+                      <outputs>
+                        <output key="BACK_VERSION" match="Cisco IOS XE Software, Version ([0-9A-Za-z.]+)" default="unknown"/>
+                      </outputs>
+                      <instruction>show version</instruction>
+                    </command>
+                    <command timeout="60sec"><instruction>show switch</instruction></command>
+                    <condition value="$OUTPUT:BACK_VERSION$" equals="$VAR:PRE_VERSION$">
+                      <then>
+                        <error abort="false">POST-CHECK FAILED on $REF:device:name$. Rolled back: running $OUTPUT:BACK_VERSION$ again. Check the switch and the policy marks above.</error>
+                      </then>
+                      <else>
+                        <policy severity="Critical">ROLLBACK: $REF:device:name$ runs $OUTPUT:BACK_VERSION$, expected $VAR:PRE_VERSION$</policy>
+                        <error abort="false">POST-CHECK FAILED and the rollback did not bring back $VAR:PRE_VERSION$ (install abort: $OUTPUT:ABORTRESULT$, now $OUTPUT:BACK_VERSION$). Use the console. Escalate.</error>
+                      </else>
+                    </condition>
+                  </then>
+                  <else>
+                    <error abort="false">POST-CHECK FAILED on $REF:device:name$. NOT committed. The switch rolls itself back when the $INPUT:ABORTTIMER$ minute timer runs out. To keep the new version, "install commit" on the console before then. To go back now, "install abort".</error>
+                  </else>
+                </condition>
+              </else>
+            </condition>
+          </then>
+          <else><echo>No post-check: a step above failed.</echo></else>
+        </condition>
+
+      </else>
+    </condition>
+  </commandsequence>
+</job>
