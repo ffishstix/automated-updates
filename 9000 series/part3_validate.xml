@@ -1,0 +1,129 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  PART 3: Post-Upgrade Validation. Run after Part 2, or any time later.
+  Catalyst 9300 / 9500 in INSTALL mode.
+
+  Read only. Cleaning up flash is Part 4.
+
+  Green only if the switch is on the target version, boots packages.conf,
+  is committed (nothing waiting, no abort timer) and every stack member is Ready
+  and on the target. The health commands below are for the record, read them in
+  the Job Analyser.
+-->
+<job xmlns="http://www.infosim.net/template"
+     xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+     xsi:schemaLocation="http://www.infosim.net/template http://xml.infosim.net/schema/job-template.xsd"
+     lifecycle="testing">
+
+  <name>Cisco IOS Upgrade - Part 3 - Post-Upgrade Validation</name>
+  <description>Checks version, boot mode, commit state and stack health and records the switch's health for the change ticket. Read only.</description>
+  <version>5</version>
+
+  <input type="normal" mandatory="true">
+    <id>TARGET</id>
+    <name>Target Version</name>
+    <default>17.12.06</default>
+  </input>
+  <validate name="Target version looks like 17.xx.xx" regex="^[0-9]+\.[0-9]+\.[0-9]+[a-z]?$$">$INPUT:TARGET$</validate>
+
+  <globalvariables>
+    <variable name="OK"/>
+    <variable name="MEMBERS_N"/>
+  </globalvariables>
+
+  <commandsequence>
+    <!-- OK starts at yes; every failed check sets it to no -->
+    <variable name="OK" value="yes"/>
+    <echo>START Part 3 on $REF:device:name$</echo>
+
+    <!-- ============ 1. CHECKS ============ -->
+    <command timeout="60sec">
+      <outputs>
+        <output key="VERSION" match="Cisco IOS XE Software, Version ([0-9A-Za-z.]+)" default="unknown"/>
+      </outputs>
+      <instruction>show version</instruction>
+    </command>
+    <condition value="$OUTPUT:VERSION$" equals="$INPUT:TARGET$" inverted="true">
+      <then><variable name="OK" value="no"/><policy severity="Critical">Runs $OUTPUT:VERSION$, expected $INPUT:TARGET$</policy></then>
+    </condition>
+
+    <command timeout="30sec">
+      <outputs>
+        <output key="BOOTVAR" match="BOOT variable = (\S+)" default="unknown"/>
+      </outputs>
+      <instruction>show boot</instruction>
+    </command>
+    <condition value="$OUTPUT:BOOTVAR$" match=".*packages\.conf.*" inverted="true">
+      <then><variable name="OK" value="no"/><policy severity="Critical">Boots $OUTPUT:BOOTVAR$, expected packages.conf (install mode)</policy></then>
+    </condition>
+
+    <!-- committed: no package marked U (activated, not committed) and no abort timer -->
+    <command timeout="60sec">
+      <outputs>
+        <output key="UNCOMMITTED" match="IMG\s+U\s+(\S+)" default="none"/>
+        <output key="ABORTACTIVE" match="(Auto abort timer: active)" default="not active"/>
+      </outputs>
+      <instruction>show install summary</instruction>
+    </command>
+    <condition value="$OUTPUT:UNCOMMITTED$" equals="none" inverted="true">
+      <then><variable name="OK" value="no"/><policy severity="Critical">$OUTPUT:UNCOMMITTED$ is activated but NOT committed</policy></then>
+    </condition>
+    <condition value="$OUTPUT:ABORTACTIVE$" equals="Auto abort timer: active">
+      <then><variable name="OK" value="no"/><policy severity="Critical">Auto-abort timer is running: the switch will roll back unless committed</policy></then>
+    </condition>
+
+    <!-- stack: every member Ready and on the target. A standalone 9500 counts 0 members but is one switch. -->
+    <command timeout="30sec" ignoreerror="true">
+      <outputs>
+        <output key="MEMBERS" match="Number of lines which match regexp = (\d+)" default="0"/>
+      </outputs>
+      <instruction>show switch | count Active|Standby|Member</instruction>
+    </command>
+    <command timeout="30sec" ignoreerror="true">
+      <outputs>
+        <output key="READY" match="Number of lines which match regexp = (\d+)" default="0"/>
+      </outputs>
+      <instruction>show switch | count Ready</instruction>
+    </command>
+    <command timeout="60sec">
+      <outputs>
+        <output key="ONTARGET" match="Number of lines which match regexp = (\d+)" default="0"/>
+      </outputs>
+      <instruction>show version | count C9.* $INPUT:TARGET$</instruction>
+    </command>
+    <variable name="MEMBERS_N" value="$OUTPUT:MEMBERS$"/>
+    <condition value="$OUTPUT:MEMBERS$" equals="0"><then><variable name="MEMBERS_N" value="1"/></then></condition>
+    <condition value="$OUTPUT:READY$" equals="$OUTPUT:MEMBERS$" inverted="true">
+      <then><variable name="OK" value="no"/><policy severity="Critical">Stack members not all Ready ($OUTPUT:READY$ of $OUTPUT:MEMBERS$)</policy></then>
+    </condition>
+    <condition value="$OUTPUT:ONTARGET$" equals="$VAR:MEMBERS_N$" inverted="true">
+      <then><variable name="OK" value="no"/><policy severity="Critical">Stack version mismatch: $OUTPUT:ONTARGET$ of $VAR:MEMBERS_N$ members on $INPUT:TARGET$</policy></then>
+    </condition>
+
+    <!-- ============ 2. HEALTH RECORD (read in the Job Analyser) ============ -->
+    <command timeout="3min"><instruction>show ip interface brief</instruction></command>
+    <command timeout="5min"><instruction>show interfaces status</instruction></command>
+    <command timeout="5min"><instruction>show spanning-tree summary</instruction></command>
+    <command timeout="2min"><instruction>show processes cpu sorted</instruction></command>
+    <command timeout="2min"><instruction>show memory statistics</instruction></command>
+    <command timeout="2min" ignoreerror="true"><instruction>show environment all</instruction></command>
+    <command timeout="2min" ignoreerror="true"><instruction>show switch</instruction></command>
+    <command timeout="2min" ignoreerror="true"><instruction>show ip route summary</instruction></command>
+    <command timeout="2min" ignoreerror="true"><instruction>show cdp neighbors</instruction></command>
+    <command timeout="2min" ignoreerror="true"><instruction>show lldp neighbors</instruction></command>
+    <command timeout="2min"><instruction>show version | include uptime</instruction></command>
+    <command timeout="3min" ignoreerror="true"><instruction>show logging | include ERROR|FAIL|CRASH|EXCEPTION|INSTALL</instruction></command>
+
+    <echo>POST-UPGRADE $REF:device:name$ | $OUTPUT:VERSION$ | boot $OUTPUT:BOOTVAR$ | uncommitted $OUTPUT:UNCOMMITTED$ | abort timer $OUTPUT:ABORTACTIVE$ | stack $OUTPUT:READY$/$OUTPUT:MEMBERS$ Ready, $OUTPUT:ONTARGET$ on target</echo>
+
+    <!-- ============ 3. RESULT ============ -->
+    <condition value="$VAR:OK$" equals="yes">
+      <then>
+        <policy severity="Compliant">POST-UPGRADE VALIDATION PASSED on $INPUT:TARGET$</policy>
+      </then>
+      <else>
+        <error abort="false">POST-UPGRADE VALIDATION FAILED on $REF:device:name$. See the policy marks above.</error>
+      </else>
+    </condition>
+  </commandsequence>
+</job>

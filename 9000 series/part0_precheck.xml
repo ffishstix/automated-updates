@@ -1,0 +1,192 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  PART 0: Pre-check. Run days before the change window, before Part 1.
+  Catalyst 9300 / 9500 in INSTALL mode, single switch or stack.
+
+  Read only: sends show commands and nothing else. Safe to run at any time and
+  as often as you like. Answers one question: can this switch be upgraded?
+
+  Checks: privilege 15, manual boot off, saved config not ignored at reload,
+  install mode, every stack member Ready, free space on the active switch's flash. Records the state for the change ticket.
+  Every check runs even after one fails, so one run lists every problem.
+-->
+<job xmlns="http://www.infosim.net/template"
+     xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+     xsi:schemaLocation="http://www.infosim.net/template http://xml.infosim.net/schema/job-template.xsd"
+     lifecycle="testing">
+
+  <name>Cisco IOS Upgrade - Part 0 - Pre-check</name>
+  <description>Read-only go/no-go checks before an IOS-XE upgrade. Changes nothing on the switch.</description>
+  <version>5</version>
+
+  <input type="normal" mandatory="true">
+    <id>TARGET</id>
+    <name>Target Version</name>
+    <default>17.12.06</default>
+    <description>Exactly as "show version" will print it.</description>
+  </input>
+  <input type="normal" mandatory="true">
+    <id>IMAGENAME</id>
+    <name>IOS Image Filename</name>
+    <default>cat9k_iosxe.17.12.06.SPA.bin</default>
+    <description>Used to see whether the image is already on flash.</description>
+  </input>
+  <input type="normal" mandatory="true">
+    <id>STORAGE</id>
+    <name>Device Storage Prefix</name>
+    <default>flash:</default>
+  </input>
+  <input type="number" mandatory="true">
+    <id>REQUIRED_FREE_MB</id>
+    <name>Required Free Space in MB</name>
+    <default>3000</default>
+    <description>About 2.5 x the image size, because install add unpacks the packages next to the .bin. 1 MB = 1,000,000 bytes. Use the same figure in Part 1.</description>
+  </input>
+
+  <validate name="Target version looks like 17.xx.xx" regex="^[0-9]+\.[0-9]+\.[0-9]+[a-z]?$$">$INPUT:TARGET$</validate>
+  <validate name="Image name ends in .bin" regex=".*\.bin$$">$INPUT:IMAGENAME$</validate>
+
+  <globalvariables>
+    <variable name="STOP"/>
+  </globalvariables>
+
+  <commandsequence>
+    <!-- STOP becomes yes at every failed check. Failed checks give a Critical policy mark, not an error:
+         in StableNet an error ends the job, and Part 0 should list every problem in one run.
+         The READY mark only comes while STOP is still no. -->
+    <variable name="STOP" value="no"/>
+    <echo>START Part 0 on $REF:device:name$</echo>
+
+    <!-- privilege 15: needed for copy, install and reload in the later parts -->
+    <command timeout="30sec">
+      <outputs>
+        <output key="PRIV" match="Current privilege level is (\d+)" default="0"/>
+      </outputs>
+      <instruction>show privilege</instruction>
+    </command>
+    <condition value="$OUTPUT:PRIV$" equals="15" inverted="true">
+      <then>
+        <variable name="STOP" value="yes"/>
+        <policy severity="Critical">Privilege level is $OUTPUT:PRIV$, needs 15. Fix the CLI credentials in StableNet.</policy>
+      </then>
+    </condition>
+
+    <!-- version (Catalyst 9000 has no config register: boot behaviour lives in ROMMON variables, checked below) -->
+    <command timeout="60sec">
+      <outputs>
+        <output key="VERSION" match="Cisco IOS XE Software, Version ([0-9A-Za-z.]+)" default="unknown"/>
+      </outputs>
+      <instruction>show version</instruction>
+    </command>
+    <echo>$REF:device:name$ ($REF:device:model$) runs $OUTPUT:VERSION$, target $INPUT:TARGET$</echo>
+    <condition value="$OUTPUT:VERSION$" equals="$INPUT:TARGET$">
+      <then><echo>Already on $INPUT:TARGET$. No upgrade needed; the checks below still run.</echo></then>
+    </condition>
+
+    <!-- boot settings in ROMMON (show romvar):
+         MANUAL_BOOT=yes stops the switch in ROMMON after a reload. Cleared with "no boot manual".
+         SWITCH_IGNORE_STARTUP_CFG=1 (password recovery) makes every reload start with an empty config.
+         Cleared with "no system ignore startupconfig switch all". Not in the output = normal. -->
+    <command timeout="30sec" ignoreerror="true">
+      <outputs>
+        <output key="MANUALBOOT" match="MANUAL_BOOT\s*=\s*(\w+)" default="no"/>
+        <output key="IGNORECFG" match="SWITCH_IGNORE_STARTUP_CFG\s*=\s*(\d)" default="0"/>
+      </outputs>
+      <instruction>show romvar</instruction>
+    </command>
+    <echo>MANUAL_BOOT = $OUTPUT:MANUALBOOT$, SWITCH_IGNORE_STARTUP_CFG = $OUTPUT:IGNORECFG$ (no and 0, or not set, are normal)</echo>
+    <condition value="$OUTPUT:MANUALBOOT$" match="[Yy][Ee][Ss]">
+      <then>
+        <variable name="STOP" value="yes"/>
+        <policy severity="Critical">MANUAL_BOOT=yes: after the Part 2 reload the switch would stop in ROMMON. Run "no boot manual", then "write memory", and check with "show romvar".</policy>
+      </then>
+    </condition>
+    <condition value="$OUTPUT:IGNORECFG$" equals="1">
+      <then>
+        <variable name="STOP" value="yes"/>
+        <policy severity="Critical">SWITCH_IGNORE_STARTUP_CFG=1: the switch ignores its saved config at every reload and would come back empty after Part 2. Run "no system ignore startupconfig switch all", then "write memory", and check with "show romvar".</policy>
+      </then>
+    </condition>
+
+    <!-- install mode: the switch must boot packages.conf -->
+    <command timeout="30sec">
+      <outputs>
+        <output key="BOOTVAR" match="BOOT variable = (\S+)" default="unknown"/>
+      </outputs>
+      <instruction>show boot</instruction>
+    </command>
+    <condition value="$OUTPUT:BOOTVAR$" match=".*packages\.conf.*" inverted="true">
+      <then>
+        <variable name="STOP" value="yes"/>
+        <policy severity="Critical">Boots $OUTPUT:BOOTVAR$: this is bundle mode. These templates are for install mode. Convert the switch first.</policy>
+      </then>
+    </condition>
+
+    <!-- stack: every member Ready. A standalone 9500 counts 0 and 0, which passes. -->
+    <command timeout="30sec" ignoreerror="true">
+      <outputs>
+        <output key="MEMBERS" match="Number of lines which match regexp = (\d+)" default="0"/>
+      </outputs>
+      <instruction>show switch | count Active|Standby|Member</instruction>
+    </command>
+    <command timeout="30sec" ignoreerror="true">
+      <outputs>
+        <output key="READY" match="Number of lines which match regexp = (\d+)" default="0"/>
+      </outputs>
+      <instruction>show switch | count Ready</instruction>
+    </command>
+    <condition value="$OUTPUT:READY$" equals="$OUTPUT:MEMBERS$" inverted="true">
+      <then>
+        <variable name="STOP" value="yes"/>
+        <policy severity="Critical">Stack members not all Ready ($OUTPUT:READY$ of $OUTPUT:MEMBERS$). Do not upgrade.</policy>
+      </then>
+    </condition>
+
+    <!-- free space on the active switch. Other members are checked by install add in Part 1. -->
+    <command timeout="60sec">
+      <outputs>
+        <!-- the last six digits are dropped, so the number is MB and stays small -->
+        <output key="FREE_MB" match="\((\d+)\d{6} bytes free\)" default="NOT_FOUND"/>
+        <output key="IMAGE_PRESENT" match="($INPUT:IMAGENAME$)" default="no"/>
+      </outputs>
+      <instruction>dir $INPUT:STORAGE$</instruction>
+    </command>
+    <echo>Free on $INPUT:STORAGE$ $OUTPUT:FREE_MB$ MB, need $INPUT:REQUIRED_FREE_MB$ MB. Image already there: $OUTPUT:IMAGE_PRESENT$</echo>
+    <condition value="$OUTPUT:FREE_MB$" equals="NOT_FOUND">
+      <then>
+        <variable name="STOP" value="yes"/>
+        <policy severity="Critical">Could not read the free space on $INPUT:STORAGE$.</policy>
+      </then>
+      <else>
+        <!-- the space only matters if the image still has to be copied -->
+        <condition value="$OUTPUT:IMAGE_PRESENT$" equals="no">
+          <then>
+            <condition value="$OUTPUT:FREE_MB$" less="$INPUT:REQUIRED_FREE_MB$">
+              <then>
+                <variable name="STOP" value="yes"/>
+                <policy severity="Critical">Not enough space: $OUTPUT:FREE_MB$ MB free, $INPUT:REQUIRED_FREE_MB$ MB needed. Free space by hand ("install remove inactive" removes unused packages).</policy>
+              </then>
+            </condition>
+          </then>
+        </condition>
+      </else>
+    </condition>
+
+    <!-- for the record: state before any change -->
+    <command timeout="60sec"><instruction>show install summary</instruction></command>
+    <command timeout="60sec" ignoreerror="true"><instruction>show switch</instruction></command>
+    <command timeout="60sec"><instruction>show inventory</instruction></command>
+
+    <!-- result -->
+    <condition value="$VAR:STOP$" equals="no">
+      <then>
+        <echo>=== READINESS $REF:device:name$ | $OUTPUT:VERSION$ -> $INPUT:TARGET$ | boot $OUTPUT:BOOTVAR$ | stack $OUTPUT:READY$/$OUTPUT:MEMBERS$ Ready | manual boot $OUTPUT:MANUALBOOT$ | free $OUTPUT:FREE_MB$ MB ===</echo>
+        <policy severity="Compliant">READY - all pre-checks passed</policy>
+      </then>
+      <else>
+        <echo>=== NOT READY $REF:device:name$: see the Critical marks above. ===</echo>
+        <error>NOT READY: one or more pre-checks failed. See the Critical marks above.</error>
+      </else>
+    </condition>
+  </commandsequence>
+</job>
