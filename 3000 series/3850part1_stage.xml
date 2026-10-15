@@ -26,11 +26,6 @@
     <id>SCPSERVER</id>
     <name>SCP Server IP or Hostname</name>
   </input>
-  <input type="number" mandatory="true">
-    <id>SCPPORT</id>
-    <name>SCP TCP Port</name>
-    <default>22</default>
-  </input>
   <input type="normal" mandatory="true">
     <id>SCPUSER</id>
     <name>SCP Username</name>
@@ -49,7 +44,7 @@
   <input type="normal" mandatory="true">
     <id>IMAGENAME</id>
     <name>IOS Image Filename</name>
-    <default>cat3k_caa-universal9.16.12.09.SPA.bin</default>
+    <default>cat3k_caa-universalk9.16.12.09.SPA.bin</default>
   </input>
   <input type="normal" mandatory="true">
     <id>TARGET</id>
@@ -70,11 +65,11 @@
   <input type="number" mandatory="true">
     <id>REQUIRED_FREE_MB</id>
     <name>Required Free Space in MB</name>
-    <default>1500</default>
+    <default>1200</default>
     <description>Same figure as in Part 0. 1 MB = 1,000,000 bytes.</description>
   </input>
 
-  <validate name="Target version looks like 17.xx.xx" regex="^\d+\.\d+\.\d+\.\d[a-z|\d]?">$INPUT:TARGET$</validate>
+  <validate name="Target version looks like 17.xx.xx" regex="^\d+\.\d+\.\d+[a-z]?$$">$INPUT:TARGET$</validate>
   <validate name="MD5 is 32 lowercase hex characters" regex="^[0-9a-f]{32}">$INPUT:MD5$</validate>
   <validate name="Image name ends in .bin" regex=".*\.bin$$">$INPUT:IMAGENAME$</validate>
 
@@ -157,15 +152,15 @@
                   </else>
                 </condition>
                  <!-- check if SCP can happen with specifically 3850 and 6807 switches-->
-                <command timeout="60">
+                <command timeout="60sec">
                     <outputs>
                         <output key="SSH" match="SSH (Enabled)" default="No" />
                     </outputs>
                     <instruction>show ip ssh</instruction>
                 </command>
-                <condition value="$OUTPUT:SSH$" equals="no">
+                <condition value="$OUTPUT:SSH$" equals="No">
                     <then>
-                        <policy severity="Critical">SSH not enabled, will not be able to copy file accross. run "ip scp server enable" with approval</policy>
+                        <policy severity="Critical">SSH not enabled, will not be able to copy file accross.</policy>
                         <variable name="STOP" value="yes" />
                     </then>
                     <else>
@@ -178,7 +173,7 @@
                                     <prompt match=".*Password:.*" response="$INPUT:SCPPASSWORD$" password="true" newline="true"/>
                                     <prompt match=".*Destination filename.*" response="" newline="true"/>
                                 </interactive>
-                                <instruction>copy SCP://$INPUT:SCPUSER$@$INPUT:SCPSERVER$:$INPUT:SCPPORT$/$INPUT:IMAGEPATH$/$INPUT:IMAGENAME$ $VAR:IMGPATH$</instruction>
+                                <instruction>copy scp://$INPUT:SCPUSER$@$INPUT:SCPSERVER$/$INPUT:IMAGEPATH$/$INPUT:IMAGENAME$ $VAR:IMGPATH$</instruction>
                                 </command>
                                 <!-- a failed copy leaves no file or a short one; both fail the MD5 -->
                                 <command timeout="40min">

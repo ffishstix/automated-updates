@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
   PART 2: Activate. Run in the change window. DISRUPTIVE: the switch reloads.
-  Catalyst 9300 / 9500 in INSTALL mode. Needs Part 1 first (packages added, Inactive).
+  Catalyst 3850 in INSTALL mode. Needs Part 1 first (packages added, Inactive).
 
   1. Guards: install mode, manual boot off, saved config not ignored at reload, stack Ready,
      target packages added by Part 1.
@@ -32,7 +32,7 @@
   <input type="normal" mandatory="true">
     <id>TARGET</id>
     <name>Target Version</name>
-    <default>17.12.06</default>
+    <default>16.12.06</default>
     <description>Same as in Part 1.</description>
   </input>
   <input type="boolean">
@@ -67,7 +67,7 @@
 
   <!-- stops the job on every switch before any command is sent -->
   <validate name="Change Control approved" regex="^true$$">$INPUT:CHANGE_APPROVED$</validate>
-  <validate name="Target version looks like 17.xx.xx" regex="^\d+\.\d+\.\d+\.\d[a-z|\d]?">$INPUT:TARGET$</validate>
+  <validate name="Target version looks like 17.xx.xx" regex="^\d+\.\d+\.\d+[a-z]?$$">$INPUT:TARGET$</validate>
   <validate name="Reload wait is a number and sec or min" regex="^[0-9]+(sec|min)$$">$INPUT:RELOADUP$</validate>
   <validate name="Settle time is a number and sec or min" regex="^[0-9]+(sec|min)$$">$INPUT:SETTLE$</validate>
 
@@ -134,7 +134,7 @@
         <command timeout="30sec" ignoreerror="true">
           <outputs>
             <output key="MANUALBOOT" match="MANUAL_BOOT\s*=\s*(\w+)" default="no"/>
-            <output key="IGNORECFG" match="SWITCH_IGNORE_STARTUP_CFG\s*=\s*(\d)" default="1"/>
+            <output key="IGNORECFG" match="SWITCH_IGNORE_STARTUP_CFG\s*=\s*(\d)" default="0"/>
           </outputs>
           <instruction>show romvar</instruction>
         </command>
@@ -163,7 +163,7 @@
           </outputs>
           <instruction>show switch | count Ready</instruction>
         </command>
-        <condition value="$OUTPUT:MEMBERS" equals="0" inverted="true">
+        <condition value="$OUTPUT:MEMBERS$" equals="0" inverted="true">
           <then>
             <condition value="$OUTPUT:READY$" equals="$OUTPUT:MEMBERS$" inverted="true">
               <then>
@@ -267,7 +267,7 @@
               <outputs>
                 <output key="POST_ONTARGET" match="Number of lines which match regexp = (\d+)" default="0"/>
               </outputs>
-              <instruction>show version | count C9.* $INPUT:TARGET$</instruction>
+              <instruction>show version | count WS-C3[68]50.* $INPUT:TARGET$</instruction>
             </command>
             <command timeout="60sec">
               <outputs>

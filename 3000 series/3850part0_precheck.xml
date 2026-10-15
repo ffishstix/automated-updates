@@ -22,13 +22,13 @@
   <input type="normal" mandatory="true">
     <id>TARGET</id>
     <name>Target Version</name>
-    <default>17.12.06</default>
+    <default>16.12.06</default>
     <description>Exactly as "show version" will print it.</description>
   </input>
   <input type="normal" mandatory="true">
     <id>IMAGENAME</id>
     <name>IOS Image Filename</name>
-    <default>cat3k_caa-universal9.16.12.09.SPA.bin</default>
+    <default>cat3k_caa-universalk9.16.12.09.SPA.bin</default>
     <description>Used to see whether the image is already on flash.</description>
   </input>
   <input type="normal" mandatory="true">
@@ -39,11 +39,11 @@
   <input type="number" mandatory="true">
     <id>REQUIRED_FREE_MB</id>
     <name>Required Free Space in MB</name>
-    <default>3000</default>
+    <default>1200</default>
     <description>About 2.5 x the image size, because install add unpacks the packages next to the .bin. 1 MB = 1,000,000 bytes. Use the same figure in Part 1.</description>
   </input>
 
-  <validate name="Target version looks like 17.xx.xx" regex="^\d+\.\d+\.\d+\.\d[a-z|\d]?">$INPUT:TARGET$</validate> <!-- changed to make more sense 
+  <validate name="Target version looks like 17.xx.xx" regex="^\d+\.\d+\.\d+[a-z]?$$">$INPUT:TARGET$</validate> <!-- changed to make more sense 
   and accomodate better versions-->
   <validate name="Image name ends in .bin" regex=".*\.bin$$">$INPUT:IMAGENAME$</validate>
 
@@ -113,7 +113,6 @@
     <command timeout="30sec">
       <outputs>
         <output key="BOOTVAR" match="BOOT variable = (\S+)" default="unknown"/>
-        <output key="REG" match="Configurataion register is \dx\d*(\d)$" default="2"/>
       </outputs>
       <instruction>show boot</instruction>
     </command>
@@ -123,15 +122,6 @@
         <policy severity="Critical">Boots $OUTPUT:BOOTVAR$: this is bundle mode. These templates are for install mode. Convert the switch first.</policy>
       </then>
     </condition>
-    <!-- if REG is not 2 then the machine will boot into rommon on next boot rather than the operating system-->
-     <condition value="$OUTPUT:REG$" match="2" inverted="true">
-      <then>
-        <variable name="STOP" value="yes"/>
-        <policy severity="Critical">Boots $OUTPUT:REG$: this will not boot into the operating system, must change the operating value to 0x102 
-          via confreg 0x102
-        </policy>
-      </then>
-     </condition>
 
     <!-- stack: every member Ready. A standalone 9500 counts 0 and 0, which passes. -->
     <command timeout="30sec" ignoreerror="true">
@@ -184,15 +174,15 @@
     </condition>
 
     <!-- check if SCP can happen with specifically 3850 and 6807 switches-->
-     <command timeout="60">
+     <command timeout="60sec">
       <outputs>
         <output key="SSH" match="SSH (Enabled)" default="No" />
       </outputs>
       <instruction>show ip ssh</instruction>
      </command>
-     <condition value="$OUTPUT:SSH$" equals="no">
+     <condition value="$OUTPUT:SSH$" equals="No">
       <then>
-        <policy severity="Critical">SSH not enabled, will not be able to copy file accross. run "ip scp server enable" with approval</policy>
+        <policy severity="Critical">SSH not enabled, will not be able to copy file accross.</policy>
         <variable name="STOP" value="yes" />
       </then>
      </condition>
