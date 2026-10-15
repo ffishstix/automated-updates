@@ -1,0 +1,223 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  PART 4: Cleanup. Run days after the upgrade, once the new release is trusted.
+  Catalyst 3000 series in INSTALL mode.
+
+  Only cleans up a finished, healthy upgrade: on the target, committed, no abort
+  timer, every stack member Ready and on the target. Otherwise nothing is removed.
+
+  1. Deletes the .bin that Part 1 copied. The switch boots packages.conf and
+     no longer needs it.
+  2. Optional: "install remove inactive" deletes the OLD release's packages.
+     After that there is no quick way back to the old version, which is why
+     it has its own box and is off by default.
+-->
+<job xmlns="http://www.infosim.net/template"
+     xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+     xsi:schemaLocation="http://www.infosim.net/template http://xml.infosim.net/schema/job-template.xsd"
+     lifecycle="testing">
+
+  <name>Cisco IOS Upgrade - Part 4 - Cleanup</name>
+  <description>Deletes the staged .bin and, if ticked, the old release's inactive packages. Only after a committed, healthy upgrade. Does not reload.</description>
+  <version>1</version>
+
+  <input type="normal" mandatory="true">
+    <id>TARGET</id>
+    <name>Target Version</name>
+    <default>16.12.06</default>
+  </input>
+  <input type="normal" mandatory="true">
+    <id>STORAGE</id>
+    <name>Device Storage Prefix</name>
+    <default>flash:</default>
+  </input>
+  <input type="normal" mandatory="true">
+    <id>IMAGENAME</id>
+    <name>IOS Image Filename</name>
+    <default>cat3k_caa-universalk9.16.12.09.SPA.bin</default>
+    <description>The .bin Part 1 copied.</description>
+  </input>
+  <input type="boolean">
+    <id>REMOVE_OLD</id>
+    <name>Also remove the old release (install remove inactive)</name>
+    <default>false</default>
+    <description>Tick only once the new release is trusted. After this the switch cannot simply go back to the old version.</description>
+  </input>
+
+  <validate name="Target version looks like 17.xx.xx" regex="^\d+\.\d+\.\d+[a-z]?$$">$INPUT:TARGET$</validate>
+  <validate name="Image name ends in .bin" regex=".*\.bin$$">$INPUT:IMAGENAME$</validate>
+
+  <globalvariables>
+    <variable name="STOP"/>
+    <variable name="MEMBERS_N"/>
+  </globalvariables>
+
+  <commandsequence>
+    <!-- STOP becomes yes at every failed guard. Nothing is deleted unless it is still no. -->
+    <variable name="STOP" value="no"/>
+    <variable name="IMGPATH" value="$INPUT:STORAGE$ $INPUT:IMAGENAME$" match="(\S+) (\S+)"/>
+    <echo>START Part 4 on $REF:device:name$. Image path: $VAR:IMGPATH$</echo>
+
+    <!-- ============ 1. GUARDS ============ -->
+    <command timeout="60sec">
+      <outputs>
+        <output key="VERSION" match="Cisco IOS XE Software, Version ([0-9A-Za-z.]+)" default="unknown"/>
+      </outputs>
+      <instruction>show version</instruction>
+    </command>
+    <condition value="$OUTPUT:VERSION$" equals="$INPUT:TARGET$" inverted="true">
+      <then>
+        <variable name="STOP" value="yes"/>
+        <error abort="false">Runs $OUTPUT:VERSION$, not $INPUT:TARGET$. Nothing removed.</error>
+      </then>
+    </condition>
+
+    <command timeout="30sec">
+      <outputs>
+        <output key="BOOTVAR" match="BOOT variable = (\S+)" default="unknown"/>
+      </outputs>
+      <instruction>show boot</instruction>
+    </command>
+    <condition value="$OUTPUT:BOOTVAR$" match=".*packages\.conf.*" inverted="true">
+      <then>
+        <variable name="STOP" value="yes"/>
+        <error abort="false">Boots $OUTPUT:BOOTVAR$, not packages.conf. In bundle mode the .bin is what the switch boots. Nothing removed.</error>
+      </then>
+    </condition>
+
+    <command timeout="60sec">
+      <outputs>
+        <output key="UNCOMMITTED" match="IMG\s+U\s+(\S+)" default="none"/>
+        <output key="ABORTACTIVE" match="(Auto abort timer: active)" default="not active"/>
+      </outputs>
+      <instruction>show install summary</instruction>
+    </command>
+    <condition value="$OUTPUT:UNCOMMITTED$" equals="none" inverted="true">
+      <then>
+        <variable name="STOP" value="yes"/>
+        <error abort="false">$OUTPUT:UNCOMMITTED$ is activated but not committed. Nothing removed.</error>
+      </then>
+    </condition>
+    <condition value="$OUTPUT:ABORTACTIVE$" equals="Auto abort timer: active">
+      <then>
+        <variable name="STOP" value="yes"/>
+        <error abort="false">The auto-abort timer is running: the switch may still roll back. Nothing removed.</error>
+      </then>
+    </condition>
+
+    <!-- every member Ready and on the target. A standalone 9500 counts 0 members but is one switch. -->
+    <command timeout="30sec" ignoreerror="true">
+      <outputs>
+        <output key="MEMBERS" match="Number of lines which match regexp = (\d+)" default="0"/>
+      </outputs>
+      <instruction>show switch | count Active|Standby|Member</instruction>
+    </command>
+    <command timeout="30sec" ignoreerror="true">
+      <outputs>
+        <output key="READY" match="Number of lines which match regexp = (\d+)" default="0"/>
+      </outputs>
+      <instruction>show switch | count Ready</instruction>
+    </command>
+    <command timeout="60sec">
+      <outputs>
+        <output key="ONTARGET" match="Number of lines which match regexp = (\d+)" default="0"/>
+      </outputs>
+      <instruction>show version | count WS-C3[68]50.* $INPUT:TARGET$</instruction>
+    </command>
+    <variable name="MEMBERS_N" value="$OUTPUT:MEMBERS$"/>
+    <condition value="$OUTPUT:MEMBERS$" equals="0"><then><variable name="MEMBERS_N" value="1"/></then></condition>
+    <condition value="$OUTPUT:READY$" equals="$OUTPUT:MEMBERS$" inverted="true">
+      <then>
+        <variable name="STOP" value="yes"/>
+        <error abort="false">Stack members not all Ready ($OUTPUT:READY$ of $OUTPUT:MEMBERS$). Nothing removed.</error>
+      </then>
+    </condition>
+    <condition value="$OUTPUT:ONTARGET$" equals="$VAR:MEMBERS_N$" inverted="true">
+      <then>
+        <variable name="STOP" value="yes"/>
+        <error abort="false">Stack version mismatch: $OUTPUT:ONTARGET$ of $VAR:MEMBERS_N$ members on $INPUT:TARGET$. Nothing removed.</error>
+      </then>
+    </condition>
+
+    <command timeout="60sec">
+      <outputs>
+        <output key="FREE_BEFORE" match="\((\d+)\d{6} bytes free\)" default="unknown"/>
+        <output key="BINTHERE" match="($INPUT:IMAGENAME$)" default="no"/>
+      </outputs>
+      <instruction>dir $INPUT:STORAGE$</instruction>
+    </command>
+    <echo>Free before: $OUTPUT:FREE_BEFORE$ MB. .bin on flash: $OUTPUT:BINTHERE$</echo>
+
+    <!-- ============ 2. CLEANUP ============ -->
+    <condition value="$VAR:STOP$" equals="no">
+      <then>
+        <condition value="$OUTPUT:BINTHERE$" equals="no">
+          <then><echo>$INPUT:IMAGENAME$ is not on $INPUT:STORAGE$ (already deleted).</echo></then>
+          <else>
+            <command timeout="2min" ignoreerror="true">
+              <interactive>
+                <prompt match=".*[Dd]elete filename.*" response="" newline="true"/>
+                <prompt match=".*confirm.*" response="" newline="true"/>
+              </interactive>
+              <instruction>delete /force $VAR:IMGPATH$</instruction>
+            </command>
+            <command timeout="60sec">
+              <outputs>
+                <output key="BINSTILL" match="($INPUT:IMAGENAME$)" default="no"/>
+              </outputs>
+              <instruction>dir $INPUT:STORAGE$</instruction>
+            </command>
+            <condition value="$OUTPUT:BINSTILL$" equals="no" inverted="true">
+              <then>
+                <variable name="STOP" value="yes"/>
+                <error abort="false">$INPUT:IMAGENAME$ could not be deleted. Delete it by hand.</error>
+              </then>
+            </condition>
+          </else>
+        </condition>
+
+        <!-- old release: only when ticked. Removes every package that is not in use, on every member. -->
+        <condition value="$INPUT:REMOVE_OLD$" equals="true">
+          <then>
+            <command timeout="30min">
+              <interactive>
+                <prompt match=".*[Dd]o you want to remove the above files.*" response="y" newline="true"/>
+              </interactive>
+              <outputs>
+                <output key="REMOVERESULT" match="(SUCCESS|FAILED)" default="unknown"/>
+              </outputs>
+              <instruction>install remove inactive</instruction>
+            </command>
+            <condition value="$OUTPUT:REMOVERESULT$" equals="SUCCESS" inverted="true">
+              <then>
+                <variable name="STOP" value="yes"/>
+                <error abort="false">install remove inactive did not report SUCCESS (got $OUTPUT:REMOVERESULT$). Check "show install log".</error>
+              </then>
+            </condition>
+          </then>
+          <else><echo>Old release packages kept (box not ticked).</echo></else>
+        </condition>
+      </then>
+      <else><echo>Nothing removed: a guard above failed.</echo></else>
+    </condition>
+
+    <!-- ============ 3. RESULT ============ -->
+    <command timeout="60sec">
+      <outputs>
+        <output key="FREE_AFTER" match="\((\d+)\d{6} bytes free\)" default="unknown"/>
+      </outputs>
+      <instruction>dir $INPUT:STORAGE$</instruction>
+    </command>
+    <command timeout="60sec"><instruction>show install summary</instruction></command>
+
+    <condition value="$VAR:STOP$" equals="no">
+      <then>
+        <echo>=== CLEANUP $REF:device:name$ | on $OUTPUT:VERSION$ | free $OUTPUT:FREE_BEFORE$ MB before, $OUTPUT:FREE_AFTER$ MB after | old release removed: $INPUT:REMOVE_OLD$ ===</echo>
+        <policy severity="Compliant">CLEANED UP on $INPUT:TARGET$</policy>
+      </then>
+      <else>
+        <echo>=== NOT CLEANED UP $REF:device:name$: see the error above. ===</echo>
+      </else>
+    </condition>
+  </commandsequence>
+</job>
