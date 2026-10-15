@@ -19,7 +19,7 @@
 
   <name>Cisco IOS Upgrade - Part 1 - Stage</name>
   <description>SCP transfer, MD5 check and install add. Run Part 0 first. Non-disruptive: does not reload and does not change the boot variable.</description>
-  <version>1</version>
+  <version>2</version>
 
   <!-- SCP repository -->
   <input type="normal" mandatory="true">

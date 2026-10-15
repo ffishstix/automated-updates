@@ -22,7 +22,7 @@
 
   <name>Cisco IOS Upgrade - Part 2 - Activate</name>
   <description>install activate with auto-abort timer, post-check, then install commit, or install abort if the post-check fails. DISRUPTIVE. Run only after change approval.</description>
-  <version>1</version>
+  <version>2</version>
 
   <input type="normal" mandatory="true">
     <id>CHANGEID</id>
